@@ -23,11 +23,16 @@ const int EXTENSION_SENSITIVITY = 2000;  // Hard extension (ignores tire noise, 
 const float NOISE_FLOOR_MAX = 500;       // Noise floor cap (prevents trigger lockout)
 const float NOISE_FLOOR_INIT = 100;      // Initial value
 
+// 5. SD CARD
+const unsigned long SD_MIN_FREE_MB = 5;  // Don't start recording below this (MB)
+const unsigned long SD_CRITICAL_MB = 1;  // Stop recording if free space drops below (MB)
+
 // Pins (Xiao ESP32S3 Sense)
 const int8_t I2S_CLK = 42;
 const int8_t I2S_DIN = 41;
 const int    SD_CS   = 21;
 // NOTE: LED shares pin with SD_CS (21) — blinks naturally during SD writes
+// When SD is full, we deinit SD and use pin 21 purely as LED for alert
 
 const uint32_t SAMPLERATE = 16000;
 I2SClass I2S;
@@ -128,7 +133,25 @@ void setup() {
   // Noise floor starts at NOISE_FLOOR_INIT — adapts to real environment in standby
 }
 
+// SD card full — deinit SD, blink LED with long pulses as alert
+void sdFullHalt() {
+  SD.end();
+  pinMode(SD_CS, OUTPUT);
+  while(1) {
+    digitalWrite(SD_CS, HIGH);
+    delay(1000);
+    digitalWrite(SD_CS, LOW);
+    delay(1000);
+  }
+}
+
 void startRecording() {
+  // Check SD free space before opening a new file
+  unsigned long freeMB = (SD.totalBytes() - SD.usedBytes()) / (1024 * 1024);
+  if (freeMB < SD_MIN_FREE_MB) {
+    sdFullHalt();
+  }
+
   String fileName = "/car_" + String(fileIndex) + ".wav";
   audioFile = SD.open(fileName, FILE_WRITE);
 
@@ -223,6 +246,13 @@ void loop() {
         if (saveCounter > 400) {
           audioFile.flush();
           saveCounter = 0;
+
+          // Check if SD is almost full
+          unsigned long freeMB = (SD.totalBytes() - SD.usedBytes()) / (1024 * 1024);
+          if (freeMB < SD_CRITICAL_MB) {
+            stopRecording();
+            sdFullHalt();
+          }
         }
       }
     }
