@@ -110,7 +110,12 @@ void setup() {
     while(1) delay(100);
   }
 
-  // Quick calibration
+  // Warm-up — PDM mic outputs garbage right after init
+  for(int i=0; i<1000; i++) {
+    I2S.read();
+  }
+
+  // Quick DC offset estimate (loop self-corrects, this just speeds it up)
   long sum = 0;
   int validSamples = 0;
   for(int i=0; i<500; i++) {
@@ -120,6 +125,7 @@ void setup() {
   if (validSamples > 0) {
     filteredZero = sum / (float)validSamples;
   }
+  // Noise floor starts at NOISE_FLOOR_INIT — adapts to real environment in standby
 }
 
 void startRecording() {

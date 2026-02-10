@@ -15,12 +15,12 @@ Perfect for hands-free voice logging, dashcam audio companions, or personal audi
 
 ## Components
 
-| Component                                                                                                                                                | Description                                                   |
-| -------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
-| [XIAO ESP32S3 Sense](https://kamami.pl/xiao/1185392-xiao-esp32s3-sense-plytka-z-modulem-wifi-i-ble-esp32-s3-oraz-kamera-i-mikrofonem-5906623414970.html) | Microcontroller with built-in PDM microphone and microSD slot |
-| 18650 Li-Ion battery                                                                                                                                     | 3.7V rechargeable cell for portable power                     |
-| 18650 battery holder                                                                                                                                     | With leads or integrated charging (TP4056 module)             |
-| microSD card                                                                                                                                             | FAT32 formatted, Class 10 recommended                         |
+| Component            | Description                                                   |
+| -------------------- | ------------------------------------------------------------- |
+| XIAO ESP32S3 Sense   | Microcontroller with built-in PDM microphone and microSD slot |
+| 18650 Li-Ion battery | 3.7V rechargeable cell for portable power                     |
+| 18650 battery holder | With leads or integrated charging (TP4056 module)             |
+| microSD card         | FAT32 formatted, Class 10 recommended                         |
 
 > [!NOTE]
 > The XIAO ESP32S3 Sense includes the microphone and SD card slot on its expansion board — no extra breakout boards needed.
