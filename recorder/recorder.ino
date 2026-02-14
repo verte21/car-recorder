@@ -4,35 +4,27 @@
 #include "SPI.h"
 #include "esp32-hal-cpu.h"
 
-// --- HIGHWAY FILTER CONFIGURATION ---
 
 // 1. TIMING
-const int INITIAL_TIME_MIN = 2;     // Initial recording window after trigger
-const int EXTENSION_TIME_MIN = 2;   // Extension added per confirmed speech spike
-const int SPIKES_TO_EXTEND = 2;     // How many loud spikes confirm a conversation?
-const int MAX_RECORDING_MIN = 10;   // Max single WAV file length (safety limit)
+const int RECORDING_TIME_MIN = 2;    // Each recording chunk length (minutes)
+const int MAX_RECORDING_MIN = 10;    // Max single WAV file length (safety limit)
 
 // 2. AUDIO
-const float GAIN = 45.0;            // Very high gain (picks up whispers)
+const float GAIN = 45.0;             // Very high gain (picks up whispers)
 
-// 3. THRESHOLDS
-const int SPIKE_SENSITIVITY = 800;       // Easy start (wakes up the device)
-const int EXTENSION_SENSITIVITY = 2000;  // Hard extension (ignores tire noise, catches voice)
+// 3. TRIGGER
+const int SPIKE_SENSITIVITY = 1500;  // Start trigger — additive above noise floor
 
 // 4. NOISE FLOOR
-const float NOISE_FLOOR_MAX = 500;       // Noise floor cap (prevents trigger lockout)
-const float NOISE_FLOOR_INIT = 100;      // Initial value
-
-// 5. SD CARD
-const unsigned long SD_MIN_FREE_MB = 5;  // Don't start recording below this (MB)
-const unsigned long SD_CRITICAL_MB = 1;  // Stop recording if free space drops below (MB)
+const float NOISE_FLOOR_MAX = 15000; // Cap (high enough for 45x gain environments)
+const float NOISE_FLOOR_INIT = 100;  // Initial value
 
 // Pins (Xiao ESP32S3 Sense)
 const int8_t I2S_CLK = 42;
 const int8_t I2S_DIN = 41;
 const int    SD_CS   = 21;
-// NOTE: LED shares pin with SD_CS (21) — blinks naturally during SD writes
-// When SD is full, we deinit SD and use pin 21 purely as LED for alert
+// LED shares pin with SD_CS (21) — blinks naturally during SD writes
+// When SD is full, we deinit SD and use pin 21 purely as LED alert
 
 const uint32_t SAMPLERATE = 16000;
 I2SClass I2S;
@@ -43,14 +35,13 @@ float filteredZero = 0;
 float noiseFloor = NOISE_FLOOR_INIT;
 bool isRecording = false;
 unsigned long stopTime = 0;
-int spikeCounter = 0;
-unsigned long lastSpikeMs = 0;
 int fileIndex = 0;
 int saveCounter = 0;
-unsigned long fileStartTime = 0;   // When the current file started
+unsigned long fileStartTime = 0;
+int writeFailCount = 0;             // Consecutive SD write failures
 
-// Buffer
-int16_t buffer[512];
+// Buffer (2KB = fewer SD writes, less wear)
+int16_t buffer[1024];
 int bufIdx = 0;
 
 // Write empty header (reserve space)
@@ -89,11 +80,10 @@ void finalizeHeader(File &file) {
 // Flush remaining buffer before closing file
 void flushBuffer() {
   if (bufIdx > 0 && audioFile) {
-    // Pad remaining buffer with silence
-    while (bufIdx < 512) {
+    while (bufIdx < 1024) {
       buffer[bufIdx++] = 0;
     }
-    audioFile.write((uint8_t*)buffer, 1024);
+    audioFile.write((uint8_t*)buffer, 2048);
     bufIdx = 0;
   }
 }
@@ -106,8 +96,11 @@ void setup() {
     while(1) delay(100);
   }
 
-  while (SD.exists("/car_" + String(fileIndex) + ".wav")) {
+  char checkName[20];
+  sprintf(checkName, "/car_%04d.wav", fileIndex);
+  while (SD.exists(checkName)) {
     fileIndex++;
+    sprintf(checkName, "/car_%04d.wav", fileIndex);
   }
 
   I2S.setPinsPdmRx(I2S_CLK, I2S_DIN);
@@ -120,7 +113,7 @@ void setup() {
     I2S.read();
   }
 
-  // Quick DC offset estimate (loop self-corrects, this just speeds it up)
+  // Quick DC offset estimate (loop self-corrects)
   long sum = 0;
   int validSamples = 0;
   for(int i=0; i<500; i++) {
@@ -130,10 +123,9 @@ void setup() {
   if (validSamples > 0) {
     filteredZero = sum / (float)validSamples;
   }
-  // Noise floor starts at NOISE_FLOOR_INIT — adapts to real environment in standby
 }
 
-// SD card full — deinit SD, blink LED with long pulses as alert
+// SD card full — deinit SD, blink LED with long pulses
 void sdFullHalt() {
   SD.end();
   pinMode(SD_CS, OUTPUT);
@@ -145,15 +137,32 @@ void sdFullHalt() {
   }
 }
 
+// Check SD free space (returns true if OK or unsupported)
+bool sdHasFreeSpace(unsigned long minMB) {
+  unsigned long total = SD.totalBytes();
+  unsigned long used = SD.usedBytes();
+  if (total == 0 || used > total) return true;
+  unsigned long freeMB = (total - used) / (1024 * 1024);
+  return freeMB >= minMB;
+}
+
 void startRecording() {
-  // Check SD free space before opening a new file
-  unsigned long freeMB = (SD.totalBytes() - SD.usedBytes()) / (1024 * 1024);
-  if (freeMB < SD_MIN_FREE_MB) {
+  if (!sdHasFreeSpace(5)) {
     sdFullHalt();
   }
 
-  String fileName = "/car_" + String(fileIndex) + ".wav";
+  char fileName[20];
+  sprintf(fileName, "/car_%04d.wav", fileIndex);
   audioFile = SD.open(fileName, FILE_WRITE);
+
+  // If open fails, reinit SD bus and retry once
+  if (!audioFile) {
+    SD.end();
+    delay(100);
+    if (SD.begin(SD_CS)) {
+      audioFile = SD.open(fileName, FILE_WRITE);
+    }
+  }
 
   if(audioFile) {
     writeDummyHeader(audioFile);
@@ -161,50 +170,36 @@ void startRecording() {
     saveCounter = 0;
     isRecording = true;
     fileStartTime = millis();
-
-    // Set 2-minute timer (only for new sessions, not file rotations)
-    if (spikeCounter == 0) {
-      stopTime = millis() + (INITIAL_TIME_MIN * 60000UL);
-      spikeCounter = 1;
-      lastSpikeMs = millis();
-    }
-
+    stopTime = millis() + (RECORDING_TIME_MIN * 60000UL);
   }
 }
 
-// File rotation (seamless — session continues in a new file)
+// File rotation (seamless — recording continues in a new file)
 void rotateFile() {
   flushBuffer();
   finalizeHeader(audioFile);
   fileIndex++;
   saveCounter = 0;
 
-  // Open new file — session continues
-  String fileName = "/car_" + String(fileIndex) + ".wav";
+  char fileName[20];
+  sprintf(fileName, "/car_%04d.wav", fileIndex);
   audioFile = SD.open(fileName, FILE_WRITE);
   if (audioFile) {
     writeDummyHeader(audioFile);
     bufIdx = 0;
     fileStartTime = millis();
   } else {
-    // Failed to open — end session
     isRecording = false;
-    spikeCounter = 0;
-    noiseFloor = NOISE_FLOOR_INIT;
   }
 }
 
-// End recording session
+// End recording
 void stopRecording() {
   flushBuffer();
   finalizeHeader(audioFile);
   isRecording = false;
   fileIndex++;
   saveCounter = 0;
-  spikeCounter = 0;
-
-  // Reset noise floor to baseline (so next trigger works easily)
-  noiseFloor = NOISE_FLOOR_INIT;
 }
 
 void loop() {
@@ -227,7 +222,7 @@ void loop() {
 
     int16_t finalSample = (int16_t)amplified;
 
-    // For volume analysis, ignore zero reads (keeps average reliable)
+    // Volume analysis (ignore zero reads)
     if (raw != 0) {
        signalSum += abs(finalSample);
        sampleCount++;
@@ -237,19 +232,36 @@ void loop() {
     if (isRecording) {
       buffer[bufIdx++] = finalSample;
 
-      if (bufIdx >= 512) {
-        audioFile.write((uint8_t*)buffer, 1024);
+      if (bufIdx >= 1024) {
+        size_t written = audioFile.write((uint8_t*)buffer, 2048);
         bufIdx = 0;
 
-        // Safety flush every ~12 seconds
+        if (written != 2048) {
+          // Write failed
+          writeFailCount++;
+          if (writeFailCount >= 3) {
+            // SD is dying — stop, reinit, recover
+            audioFile.close();
+            isRecording = false;
+            SD.end();
+            delay(200);
+            SD.begin(SD_CS);
+            fileIndex++;
+            writeFailCount = 0;
+            break;  // Exit sample loop, return to standby
+          }
+        } else {
+          writeFailCount = 0;  // Reset on successful write
+        }
+
+        // Safety flush every ~48 seconds
         saveCounter++;
         if (saveCounter > 400) {
           audioFile.flush();
           saveCounter = 0;
 
           // Check if SD is almost full
-          unsigned long freeMB = (SD.totalBytes() - SD.usedBytes()) / (1024 * 1024);
-          if (freeMB < SD_CRITICAL_MB) {
+          if (!sdHasFreeSpace(1)) {
             stopRecording();
             sdFullHalt();
           }
@@ -262,59 +274,30 @@ void loop() {
   float currentVolume = 0;
   if (sampleCount > 0) currentVolume = signalSum / sampleCount;
 
-  // --- HIGHWAY FILTER LOGIC ---
-
-  // Two thresholds:
-  // 1. Easy (800) — triggers recording start
+  // Trigger threshold
   float startTrigger = noiseFloor + SPIKE_SENSITIVITY;
 
-  // 2. Hard (2000) — extends recording (tire noise won't pass, voice will)
-  float extensionTrigger = noiseFloor + EXTENSION_SENSITIVITY;
-
-  bool startSignal = (currentVolume > startTrigger);
-  bool extensionSignal = (currentVolume > extensionTrigger);
-
-  // Debounce (1 second gap between spikes)
-  bool debounceOk = (millis() - lastSpikeMs > 1000);
-
   if (!isRecording) {
-    // STANDBY MODE
-    // Update noise floor (with cap!)
+    // STANDBY — adapt noise floor, wait for trigger
     noiseFloor = (noiseFloor * 0.98) + (currentVolume * 0.02);
     if (noiseFloor > NOISE_FLOOR_MAX) noiseFloor = NOISE_FLOOR_MAX;
 
-    // Wake up on any loud sound
-    if (startSignal && debounceOk) {
+    if (currentVolume > startTrigger) {
       startRecording();
     }
 
   } else {
-    // RECORDING MODE
+    // RECORDING — adapt noise floor slowly, check timers
+    noiseFloor = (noiseFloor * 0.998) + (currentVolume * 0.002);
+    if (noiseFloor > NOISE_FLOOR_MAX) noiseFloor = NOISE_FLOOR_MAX;
 
-    // Extend ONLY if sound is very loud/distinct (speech)
-    // Steady tire noise won't exceed the extension threshold
-    if (extensionSignal && debounceOk) {
-      spikeCounter++;
-      lastSpikeMs = millis();
-
-      // Confirmed conversation (enough spikes)
-      if (spikeCounter >= SPIKES_TO_EXTEND) {
-        // Extend by 2 minutes from now
-        unsigned long newStopTime = millis() + (EXTENSION_TIME_MIN * 60000UL);
-        if (newStopTime > stopTime) {
-          stopTime = newStopTime;
-        }
-      }
-    }
-
-    // Safety: max file length (rotate file, session continues)
+    // Safety: max file length (rotate, recording continues)
     if (millis() - fileStartTime > (MAX_RECORDING_MIN * 60000UL)) {
       rotateFile();
     }
 
-    // Check if session timer expired
+    // Timer expired — stop recording, back to standby
     if (millis() > stopTime) {
-      // No recent spikes = conversation over, back to standby
       stopRecording();
     }
   }
